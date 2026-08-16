@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-vlc-ai-subs — Whisper transcription backend.
-
-Transcribes audio from a media file using faster-whisper (or openai-whisper
-as fallback) and streams results as JSON lines to stdout. Also writes a
-standard SRT subtitle file next to the source media.
-
 Usage:
-    python3 aisubs_whisper.py <media_path> <model> <language> <task>
+    python3 aisubs_whisper.py <media_path>
 
 Arguments:
     media_path  Path to the video/audio file
-    model       Whisper model size: tiny, base, small, medium, large
-    language    Language code (e.g. en, es, hi) or "auto" for detection
-    task        "transcribe" or "translate" (translate outputs English)
 
 Output (stdout):
     One JSON object per line:
@@ -51,18 +42,18 @@ def emit(data: dict) -> None:
             pass
 
 
-def transcribe_faster_whisper(media_path, model_name, lang, task):
+def transcribe_faster_whisper(media_path):
     """Transcribe using faster-whisper (CTranslate2 backend)."""
     from faster_whisper import WhisperModel
 
-    emit({"type": "status", "msg": f"Loading {model_name} model..."})
-    model = WhisperModel(model_name, device="cuda", compute_type="float16")
+    emit({"type": "status", "msg": f"Loading model..."})
+    model = WhisperModel("small", device="cuda", compute_type="float16")
 
     emit({"type": "status", "msg": "Transcribing..."})
     segments_gen, _info = model.transcribe(
         media_path,
-        language=lang,
-        task=task,
+        language="ja",
+        task="transcribe",
         beam_size=1,
         vad_filter=True,
         vad_parameters={
@@ -79,41 +70,20 @@ def transcribe_faster_whisper(media_path, model_name, lang, task):
             yield {"start": seg.start, "end": seg.end, "text": text}
 
 
-def transcribe_openai_whisper(media_path, model_name, lang, task):
-    """Transcribe using openai-whisper (fallback)."""
-    import whisper
-
-    emit({"type": "status", "msg": f"Loading {model_name} model..."})
-    model = whisper.load_model(model_name)
-
-    emit({"type": "status", "msg": "Transcribing (batch mode)..."})
-    options = {"task": task}
-    if lang:
-        options["language"] = lang
-    result = model.transcribe(media_path, **options)
-
-    for seg in result["segments"]:
-        text = seg["text"].strip()
-        if text:
-            yield {"start": seg["start"], "end": seg["end"], "text": text}
-
 
 def main():
     global _out_file
 
-    if len(sys.argv) < 5:
-        emit({"type": "error", "msg": "Usage: aisubs_whisper.py <media> <model> <lang> <task> [out_file]"})
+    if len(sys.argv) < 2:
+        emit({"type": "error", "msg": "Usage: aisubs_whisper.py <media> [out_file]"})
         sys.exit(1)
 
     media_path = sys.argv[1]
-    model_name = sys.argv[2]
-    language = sys.argv[3] if sys.argv[3] != "auto" else None
-    task = sys.argv[4]
 
     # Optional output file — Lua passes this so output is captured without shell redirection
-    if len(sys.argv) > 5:
+    if len(sys.argv) > 2:
         try:
-            _out_file = open(sys.argv[5], "w", encoding="utf-8", buffering=1)
+            _out_file = open(sys.argv[2], "w", encoding="utf-8", buffering=1)
         except Exception as e:
             pass  # if we can't open it, stdout-only mode
 
@@ -129,19 +99,7 @@ def main():
     except ImportError:
         pass
 
-    if not backend:
-        try:
-            import whisper  # noqa: F401
-            backend = "openai-whisper"
-        except ImportError:
-            emit({"type": "error", "msg": "No Whisper backend found. Run: pip install faster-whisper"})
-            sys.exit(1)
-
-    # Choose transcription function
-    if backend == "faster-whisper":
-        segments_iter = transcribe_faster_whisper(media_path, model_name, language, task)
-    else:
-        segments_iter = transcribe_openai_whisper(media_path, model_name, language, task)
+    segments_iter = transcribe_faster_whisper(media_path)
 
     # Stream segments and build SRT
     srt_lines = []
