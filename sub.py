@@ -55,16 +55,10 @@ def transcribe_faster_whisper(media_path):
         language="ja",
         task="transcribe",
         beam_size=5,
-        temperature=0,
+        
         word_timestamps=True,
         condition_on_previous_text=False,
-        vad_filter=True,
-        vad_parameters={
-            "threshold": 0.3,
-            "min_silence_duration_ms": 300,
-            "speech_pad_ms": 150,
-            "min_speech_duration_ms": 100,
-        },
+        vad_filter=False,
     )
 
     for seg in segments_gen:
