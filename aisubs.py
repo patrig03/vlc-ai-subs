@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
+vlc-ai-subs — Whisper transcription backend.
+
+Transcribes audio from a media file using faster-whisper (or openai-whisper
+as fallback) and streams results as JSON lines to stdout. Also writes a
+standard SRT subtitle file next to the source media.
+
 Usage:
-    python3 aisubs_whisper.py <media_path>
+    python3 aisubs.py <media_path> <model> <language> <task>
 
 Arguments:
     media_path  Path to the video/audio file
+    model       Whisper model size: tiny, base, small, medium, large
+    language    Language code (e.g. en, es, hi) or "auto" for detection
+    task        "transcribe" or "translate" (translate outputs English)
 
 Output (stdout):
     One JSON object per line:
@@ -42,18 +51,26 @@ def emit(data: dict) -> None:
             pass
 
 
-def transcribe_faster_whisper(media_path):
+def transcribe_whisper(media_path, model_name, lang, task):
+    """Transcribe using faster-whisper (CTranslate2 backend)."""
     from faster_whisper import WhisperModel
 
-    emit({"type": "status", "msg": "Loading model..."})
-    model = WhisperModel("medium", device="cuda", compute_type="float16")
+    emit({
+        "type": "status", 
+        "msg": f"Loading {model_name} model..."
+    })
 
-    emit({"type": "status", "msg": "Transcribing..."})
+    model = WhisperModel(model_name, device="cuda", compute_type="float16")
+
+    emit({
+        "type": "status", 
+        "msg": "Transcribing..."
+    })
 
     segments_gen, _info = model.transcribe(
         media_path,
-        language="ja",
-        task="transcribe",
+        language=lang,
+        task=task,
         beam_size=5,
         
         word_timestamps=True,
@@ -76,25 +93,30 @@ def transcribe_faster_whisper(media_path):
 def main():
     global _out_file
 
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 5:
         emit({
-            "type": "error",
-            "msg": "Usage: aisubs_whisper.py <media> [out_file]"
+            "type": "error", 
+            "msg": "Usage: aisubs.py <media> <model> <lang> <task> [out_file]"
         })
         sys.exit(1)
 
     media_path = sys.argv[1]
+    model_name = sys.argv[2]
+    language = sys.argv[3] if sys.argv[3] != "auto" else None
+    task = sys.argv[4]
 
-    if len(sys.argv) > 2:
+
+    # Optional output file — Lua passes this so output is captured without shell redirection
+    if len(sys.argv) > 5:
         try:
             _out_file = open(
-                sys.argv[2],
-                "w",
-                encoding="utf-8",
+                sys.argv[5], 
+                "w", 
+                encoding="utf-8", 
                 buffering=1
             )
-        except Exception:
-            pass
+        except Exception as e:
+            pass  # if we can't open it, stdout-only mode
 
     if not os.path.isfile(media_path):
         emit({
@@ -116,7 +138,7 @@ def main():
     count = 0
 
     try:
-        for seg in transcribe_faster_whisper(media_path):
+        for seg in transcribe_whisper(media_path, model_name, language, task):
             text = seg["text"]
             words = seg["words"]
 
@@ -159,6 +181,7 @@ def main():
         })
         sys.exit(1)
 
+    # Write SRT file next to the media
     base, _ = os.path.splitext(media_path)
     srt_path = base + ".srt"
 
@@ -187,7 +210,10 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
-        emit({"type": "error", "msg": str(e) + "\n" + traceback.format_exc()})
+        emit({
+            "type": "error", 
+            "msg": str(e) + "\n" + traceback.format_exc()
+        })
         if _out_file:
             _out_file.close()
         sys.exit(1)
