@@ -60,7 +60,10 @@ def transcribe_whisper(media_path, model_name, lang, task):
         "msg": f"Loading {model_name} model..."
     })
 
-    model = WhisperModel(model_name, device="cuda", compute_type="float16")
+    try:
+        model = WhisperModel(model_name, device="cuda", compute_type="float16")
+    except Exception:
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
     emit({
         "type": "status", 

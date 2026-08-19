@@ -128,6 +128,17 @@ end
 -- Path helpers
 ----------------------------------------------------------------
 
+function shell_quote(str)
+    if str == nil then
+        return "''"
+    end
+
+    str = tostring(str)
+
+    -- Wrap in single quotes. A literal ' becomes '\''.
+    return "'" .. str:gsub("'", "'\\''") .. "'"
+end
+
 function is_windows()
     return package.config:sub(1, 1) == "\\"
 end
@@ -204,25 +215,34 @@ function find_script()
     return nil
 end
 
-function find_python(script_dir)
+-- find a Python interpreter to run launch.py.
+-- Priority: bundled venv → explicit AI_SUBS_PYTHON → system python.
+function find_python_for_launcher(script_dir)
     local sep = is_windows() and "\\" or "/"
 
-    -- venv on Unix
+    -- plugin-bundled venv
     local p = script_dir .. sep .. "venv" .. sep .. "bin" .. sep .. "python3"
     local f = io.open(p, "r")
     if f then f:close(); return p end
 
-    -- venv on Windows
     p = script_dir .. sep .. "venv" .. sep .. "Scripts" .. sep .. "python.exe"
     f = io.open(p, "r")
     if f then f:close(); return p end
 
+    -- explicit configured Python (validated to be an existing file)
+    local explicit = os.getenv("AI_SUBS_PYTHON")
+    if explicit then
+        f = io.open(explicit, "r")
+        if f then f:close(); return explicit end
+    end
+
+    -- last resort: system python
     return is_windows() and "python" or "python3"
 end
 
-----------------------------------------------------------------
+---------------------------------------------------------------
 -- Main entry
-----------------------------------------------------------------
+---------------------------------------------------------------
 
 function start_generation()
     
@@ -245,7 +265,7 @@ function start_generation()
     end
     
     local script_dir = string.match(script, "(.+)[/\\][^/\\]+$") or "."
-    local python    = find_python(script_dir)
+    local launch_script = script_dir .. (is_windows() and "\\" or "/") .. "launch.py"
     local model     = get_model_name()
     local language  = lang_input:get_text() or "auto"
     local task      = get_task()
@@ -260,42 +280,46 @@ function start_generation()
     test_f:write("init\n")
     test_f:close()
 
+    local launch_python = find_python_for_launcher(script_dir)
 
     local cmd
     if is_windows() then
+        -- Windows: use wscript to run launch.py in background
         local vbs_file = string.gsub(tmp_file, "%.txt$", ".vbs")
         local vf = io.open(vbs_file, "w")
         if not vf then
             set_status("Error: cannot write helper file: " .. vbs_file)
             return
         end
-        -- In VBScript string literals a literal double-quote is written as ""
-        local ld_lib = is_windows() and "" or "LD_LIBRARY_PATH=/opt/cuda/lib64:/usr/local/lib;"
-        local raw_cmd = string.format('"%s" -u "%s" "%s" "%s" "%s" "%s" "%s"',
-            python, script, media_path, model, language, task, tmp_file)
-        local vbs_cmd = ld_lib .. raw_cmd:gsub('"', '""')
+        local raw_cmd = string.format('"%s" -u "%s" "%s" "%s" "%s" "%s" "%s" "%s"',
+            launch_python, launch_script, media_path, model, language, task, tmp_file, tmp_file)
         vf:write('Set sh = CreateObject("WScript.Shell")\n')
-        vf:write('sh.Run "' .. vbs_cmd .. '", 0, False\n')  -- 0=hidden, False=don't wait
+        vf:write('sh.Run "' .. raw_cmd:gsub('"', '""') .. '", 0, False\n')
         vf:close()
         cmd = 'wscript.exe /nologo "' .. vbs_file .. '"'
     else
-        local cublas_path = "/home/patri/Projects/ai-subs/venv/lib/python3.14/site-packages/nvidia/cublas/lib"
-        cmd = string.format(
-            'LD_LIBRARY_PATH="%s:$LD_LIBRARY_PATH" "%s" -u "%s" "%s" "%s" "%s" "%s" "%s" &',
-            cublas_path,
-            python,
-            script,
-            media_path,
-            model,
-            language,
-            task,
-            tmp_file
+        -- Unix: run launch.py asynchronously through bash
+        local inner_cmd = string.format(
+            '%s -u %s %s %s %s %s %s %s',
+            shell_quote(launch_python),
+            shell_quote(launch_script),
+            shell_quote(media_path),
+            shell_quote(model),
+            shell_quote(language),
+            shell_quote(task),
+            shell_quote(tmp_file),
+            shell_quote(tmp_file)
         )
+
+        cmd = string.format(
+            'bash -c %s &',
+            shell_quote(inner_cmd)
+        )
+
         vlc.msg.info("[AI Subs] cmd: " .. cmd)
     end
     
-    
-    vlc.msg.info("[AI Subs] python: " .. python)
+    vlc.msg.info("[AI Subs] python: " .. launch_python)
     vlc.msg.info("[AI Subs] media:  " .. media_path)
     vlc.msg.info("[AI Subs] tmp:    " .. tmp_file)
 
