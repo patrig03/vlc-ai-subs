@@ -4,7 +4,7 @@ function descriptor()
         version = "3.2",
         author = "patri",
         url = "https://github.com/voidrlm/vlc-ai-subs",
-        shortdesc = "AI subtitle generator (jp)",
+        shortdesc = "AI subtitle generator",
         description = "Generate subtitles using Whisper AI"
             .. "Compatible with VLC 3.x and 4.x.",
         capabilities = {"menu"},
