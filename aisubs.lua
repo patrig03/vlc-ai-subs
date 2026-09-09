@@ -20,6 +20,7 @@ local mode_dropdown = nil
 local status_label = nil
 local osd_channel  = nil
 local audio_track_dropdown   = nil
+local audio_track_input      = nil
 local audio_channel_dropdown = nil
 
 -- Polling state (set by start_generation, used by poll_progress)
@@ -64,14 +65,47 @@ function create_dialog()
     task_dropdown:add_value("Transcribe (same language)", 1)
     task_dropdown:add_value("Translate to English", 2)
 
-    dlg:add_label("Audio Track:", 1, 5, 1, 1)
-    audio_track_dropdown = dlg:add_dropdown(2, 5, 2, 1)
-    -- Placeholders; will be populated dynamically if ffprobe is available
-    audio_track_dropdown:add_value("Auto (default)", 1)
-    audio_track_dropdown:add_value("Track 1 (0:a:0)", 2)
-    audio_track_dropdown:add_value("Track 2 (0:a:1)", 3)
-    audio_track_dropdown:add_value("Track 3 (0:a:2)", 4)
-    audio_track_dropdown:add_value("Track 4 (0:a:3)", 5)
+    -- Probe audio tracks from current media (if any) to decide widget type.
+    -- If file info is available via ffprobe, show a populated dropdown.
+    -- Otherwise fall back to a manual text input so the user can type the
+    -- track number (or "auto").
+    local detected = nil
+    pcall(function()
+        local mp, _ = get_media_path()
+        if mp then detected = probe_audio_tracks(mp) end
+    end)
+
+    if detected and #detected > 0 then
+        dlg:add_label("Audio Track:", 1, 5, 1, 1)
+        audio_track_dropdown = dlg:add_dropdown(2, 5, 2, 1)
+        audio_track_input = nil
+        audio_track_dropdown:add_value("Auto (default)", 1)
+        for i, t in ipairs(detected) do
+            local label
+            if t.title and t.title ~= "" and t.title ~= t.codec then
+                label = string.format("Track %d: %s (%s, %sch) [0:a:%d]", i, t.title, t.lang, t.chans, i-1)
+            else
+                label = string.format("Track %d: %s %sch (%s) [0:a:%d]", i, t.codec, t.chans, t.lang, i-1)
+            end
+            audio_track_dropdown:add_value(label, i + 1)
+        end
+    else
+        -- No file info (no media loaded, ffprobe missing, or probe failed)
+        -- -> let the user type the track index manually.
+        if detected == nil then
+            -- Could be no media; show hint in label
+            local mp, _ = get_media_path()
+            if not mp then
+                dlg:add_label("Audio Track (type number or auto):", 1, 5, 1, 1)
+            else
+                dlg:add_label("Audio Track (ffprobe unavailable):", 1, 5, 1, 1)
+            end
+        else
+            dlg:add_label("Audio Track (number or auto):", 1, 5, 1, 1)
+        end
+        audio_track_input = dlg:add_text_input("auto", 2, 5, 2, 1)
+        audio_track_dropdown = nil
+    end
 
     dlg:add_label("Audio Channel:", 1, 6, 1, 1)
     audio_channel_dropdown = dlg:add_dropdown(2, 6, 2, 1)
@@ -80,16 +114,19 @@ function create_dialog()
     audio_channel_dropdown:add_value("Left channel only", 3)
     audio_channel_dropdown:add_value("Right channel only", 4)
     audio_channel_dropdown:add_value("Center channel", 5)
-    audio_channel_dropdown:add_value("Channel 0", 6)
-    audio_channel_dropdown:add_value("Channel 1", 7)
-    audio_channel_dropdown:add_value("Channel 2", 8)
 
-    dlg:add_button("Generate", start_generation, 1, 7, 3, 1)
-    status_label = dlg:add_label("Ready. Play a media file and click Generate.", 1, 8, 3, 1)
+    -- Row 7: Generate + Refresh
+    dlg:add_button("Generate", start_generation, 1, 7, 2, 1)
+    dlg:add_button("Refresh Tracks", create_dialog, 3, 7, 1, 1)
+
+    local hint = "Ready. Play a media file and click Generate. Use Refresh to reload audio tracks."
+    if detected and #detected > 0 then
+        hint = string.format("Detected %d audio track(s). Choose one and click Generate.", #detected)
+    elseif detected == nil then
+        hint = "No media detected. Type track number (0,1..) or 'auto'. Click Refresh after loading file."
+    end
+    status_label = dlg:add_label(hint, 1, 8, 3, 1)
     dlg:show()
-
-    -- Try to auto-detect audio tracks for the current media (best-effort)
-    pcall(refresh_audio_tracks)
 end
 
 ----------------------------------------------------------------
@@ -109,11 +146,23 @@ function get_task()
 end
 
 function get_audio_track()
-    if not audio_track_dropdown then return "auto" end
-    local id = audio_track_dropdown:get_value()
-    if not id or id == 1 then return "auto" end
-    -- id 2 -> 0, 3 -> 1, etc.
-    return tostring(id - 2)
+    if audio_track_input then
+        local txt = audio_track_input:get_text()
+        if not txt then return "auto" end
+        txt = tostring(txt):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+        if txt == "" or txt == "auto" or txt == "default" then return "auto" end
+        -- Allow numeric index; strip "0:a:" prefix if user pasted it
+        local num = txt:match("0:a:(%d+)") or txt:match("(%d+)")
+        if num then return num end
+        return "auto"
+    end
+    if audio_track_dropdown then
+        local id = audio_track_dropdown:get_value()
+        if not id or id == 1 then return "auto" end
+        -- id 2 -> 0, 3 -> 1, etc.
+        return tostring(id - 2)
+    end
+    return "auto"
 end
 
 function get_audio_channel()
@@ -132,7 +181,8 @@ function get_audio_channel()
     return map[id] or "auto"
 end
 
--- Probe audio streams via ffprobe (CSV output): index,codec_name,channels,language
+-- Probe audio streams via ffprobe (CSV output): index,codec_name,channels,language,title
+-- Returns array of {idx, codec, chans, lang, title, raw} or nil if detection fails.
 function probe_audio_tracks(media_path)
     local ffprobe = "ffprobe"
     -- Quick check: try ffprobe -version; if fails, ffprobe not available
@@ -152,7 +202,7 @@ function probe_audio_tracks(media_path)
     end
 
     local cmd = string.format(
-        '%s -v error -select_streams a -show_entries stream=index,codec_name,channels:stream_tags=language -of csv=p=0 %s 2>&1',
+        '%s -v error -select_streams a -show_entries stream=index,codec_name,channels:stream_tags=language,title -of csv=p=0 %s 2>&1',
         ffprobe, shell_quote(media_path)
     )
     vlc.msg.info("[AI Subs] probing audio: " .. cmd)
@@ -161,63 +211,65 @@ function probe_audio_tracks(media_path)
     local out = pipe:read("*a")
     pipe:close()
     if not out or out == "" then return nil end
+    -- ffprobe prints nothing on files with no audio; treat as nil so caller falls back to manual input.
+    -- But an empty string already handled above.
+
+    -- If ffprobe wrote an error (e.g. "No such file"), return nil to trigger manual fallback
+    if out:match("No such file") or out:match("Invalid data") or out:match("Error") then
+        -- But still allow valid CSV even if warning appears; check if any valid line exists
+        local has_valid = false
+        for _line in string.gmatch(out, "[^\r\n]+") do
+            if _line:match("^%s*%d+%s*,") then has_valid = true; break end
+        end
+        if not has_valid then
+            vlc.msg.info("[AI Subs] ffprobe error: " .. out:sub(1,200))
+            return nil
+        end
+    end
 
     local tracks = {}
     for _line in string.gmatch(out, "[^\r\n]+") do
         local line = _line:gsub("^%s+", ""):gsub("%s+$", "")
-        if line ~= "" then
-            -- CSV: index,codec_name,channels,language  (language may be missing)
+        if line ~= "" and not line:match("^%s*$") and not line:match("^ffprobe") then
+            -- CSV: index,codec_name,channels,language,title  (language/title may be missing/empty)
+            -- Titles may contain commas; ffprobe CSV escapes them. Simple split on comma
+            -- will still work for our labels because title is last field; we join extras.
             local parts = {}
             for part in string.gmatch(line .. ",", "([^,]*),") do
                 table.insert(parts, part)
             end
-            local idx = parts[1] or "?"
-            local codec = parts[2] or "unknown"
-            local chans = parts[3] or "?"
-            local lang = parts[4] or ""
-            if lang == "" then lang = "und" end
-            table.insert(tracks, {idx=idx, codec=codec, chans=chans, lang=lang, raw=line})
+            local idx   = (parts[1] or ""):gsub("%s+", "")
+            -- Validate: index must be numeric, otherwise it's an error message -> skip
+            if not idx:match("^%d+$") then
+                vlc.msg.info("[AI Subs] skipping non-track line: " .. line)
+            else
+                local codec = parts[2] or "unknown"
+                local chans = parts[3] or "?"
+                local lang  = parts[4] or ""
+                -- Join any remaining parts as title (title may contain commas)
+                local title = ""
+                if #parts > 5 then
+                    local tparts = {}
+                    for i = 5, #parts do table.insert(tparts, parts[i]) end
+                    title = table.concat(tparts, ",")
+                else
+                    title = parts[5] or ""
+                end
+                if lang == "" then lang = "und" end
+                -- Clean quotes that ffprobe CSV may add
+                title = title:gsub('^%s*"', ""):gsub('"%s*$', "")
+                table.insert(tracks, {idx=idx, codec=codec, chans=chans, lang=lang, title=title, raw=line})
+            end
         end
     end
     if #tracks == 0 then return nil end
     return tracks
 end
 
+-- Legacy helper kept for compatibility: recreates the dialog so tracks are
+-- re-probed from the currently playing file. Prefer the Refresh button.
 function refresh_audio_tracks()
-    local media_path, _ = get_media_path()
-    if not media_path then return end
-    local tracks = probe_audio_tracks(media_path)
-    if not tracks or #tracks == 0 then return end
-    if not audio_track_dropdown or not dlg then return end
-
-    -- Repopulate dropdown with detected info.
-    -- VLC Lua dropdown has no clear() API, so we delete and recreate the dropdown.
-    -- Workaround: keep existing 5 entries and add detailed labels if needed via status.
-    -- Better: try to set value labels by re-adding. Since we can't clear, we just log
-    -- and keep the generic entries — user can still select Track N which maps to 0:a:N-1.
-    -- To improve UX, we append detected info to status label.
-    local info = string.format("Detected %d audio track(s): ", #tracks)
-    for i, t in ipairs(tracks) do
-        info = info .. string.format("[%d] %s %sch (%s) ", i, t.codec, t.chans, t.lang)
-    end
-    vlc.msg.info("[AI Subs] " .. info)
-    if status_label then
-        -- Only update if still showing ready message
-        local cur = nil
-        pcall(function() cur = status_label:get_text() end)
-        -- Don't overwrite active transcription status; just log to vlc.msg
-    end
-    -- Attempt to rebuild dropdown if VLC supports deleting single widget:
-    -- Some VLC builds allow dlg:del_widget, but not documented. We try best-effort.
-    pcall(function()
-        -- If we can add more entries, add them with detailed names (id 6+)
-        for i, t in ipairs(tracks) do
-            if i > 5 then
-                local label = string.format("Track %d (%s %sch %s)", i, t.codec, t.chans, t.lang)
-                audio_track_dropdown:add_value(label, i + 1)
-            end
-        end
-    end)
+    pcall(create_dialog)
 end
 
 ----------------------------------------------------------------
