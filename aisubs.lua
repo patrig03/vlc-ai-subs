@@ -1,12 +1,13 @@
 function descriptor()
     return {
         title = "AI Subs Generator",
-        version = "3.2",
+        version = "3.3",
         author = "patri",
         url = "https://github.com/voidrlm/vlc-ai-subs",
         shortdesc = "AI subtitle generator",
         description = "Generate subtitles using Whisper AI"
-            .. "Compatible with VLC 3.x and 4.x.",
+            .. "Compatible with VLC 3.x and 4.x."
+            .. " Supports audio track/channel selection.",
         capabilities = {"menu"},
     }
 end
@@ -18,6 +19,8 @@ local task_dropdown = nil
 local mode_dropdown = nil
 local status_label = nil
 local osd_channel  = nil
+local audio_track_dropdown   = nil
+local audio_channel_dropdown = nil
 
 -- Polling state (set by start_generation, used by poll_progress)
 local _poll_tmp   = nil
@@ -61,9 +64,32 @@ function create_dialog()
     task_dropdown:add_value("Transcribe (same language)", 1)
     task_dropdown:add_value("Translate to English", 2)
 
-    dlg:add_button("Generate", start_generation, 1, 5, 3, 1)
-    status_label = dlg:add_label("Ready. Play a media file and click Generate.", 1, 6, 3, 1)
+    dlg:add_label("Audio Track:", 1, 5, 1, 1)
+    audio_track_dropdown = dlg:add_dropdown(2, 5, 2, 1)
+    -- Placeholders; will be populated dynamically if ffprobe is available
+    audio_track_dropdown:add_value("Auto (default)", 1)
+    audio_track_dropdown:add_value("Track 1 (0:a:0)", 2)
+    audio_track_dropdown:add_value("Track 2 (0:a:1)", 3)
+    audio_track_dropdown:add_value("Track 3 (0:a:2)", 4)
+    audio_track_dropdown:add_value("Track 4 (0:a:3)", 5)
+
+    dlg:add_label("Audio Channel:", 1, 6, 1, 1)
+    audio_channel_dropdown = dlg:add_dropdown(2, 6, 2, 1)
+    audio_channel_dropdown:add_value("Auto (mix to mono)", 1)
+    audio_channel_dropdown:add_value("Mono (force downmix)", 2)
+    audio_channel_dropdown:add_value("Left channel only", 3)
+    audio_channel_dropdown:add_value("Right channel only", 4)
+    audio_channel_dropdown:add_value("Center channel", 5)
+    audio_channel_dropdown:add_value("Channel 0", 6)
+    audio_channel_dropdown:add_value("Channel 1", 7)
+    audio_channel_dropdown:add_value("Channel 2", 8)
+
+    dlg:add_button("Generate", start_generation, 1, 7, 3, 1)
+    status_label = dlg:add_label("Ready. Play a media file and click Generate.", 1, 8, 3, 1)
     dlg:show()
+
+    -- Try to auto-detect audio tracks for the current media (best-effort)
+    pcall(refresh_audio_tracks)
 end
 
 ----------------------------------------------------------------
@@ -80,6 +106,118 @@ end
 function get_task()
     if task_dropdown:get_value() == 2 then return "translate" end
     return "transcribe"
+end
+
+function get_audio_track()
+    if not audio_track_dropdown then return "auto" end
+    local id = audio_track_dropdown:get_value()
+    if not id or id == 1 then return "auto" end
+    -- id 2 -> 0, 3 -> 1, etc.
+    return tostring(id - 2)
+end
+
+function get_audio_channel()
+    if not audio_channel_dropdown then return "auto" end
+    local id = audio_channel_dropdown:get_value()
+    local map = {
+        [1] = "auto",
+        [2] = "mono",
+        [3] = "left",
+        [4] = "right",
+        [5] = "center",
+        [6] = "0",
+        [7] = "1",
+        [8] = "2",
+    }
+    return map[id] or "auto"
+end
+
+-- Probe audio streams via ffprobe (CSV output): index,codec_name,channels,language
+function probe_audio_tracks(media_path)
+    local ffprobe = "ffprobe"
+    -- Quick check: try ffprobe -version; if fails, ffprobe not available
+    local ok, _ = pcall(function()
+        local p = io.popen(ffprobe .. " -version 2>&1", "r")
+        if p then
+            local o = p:read("*a")
+            p:close()
+            if not o or not string.find(o, "ffprobe") then error("not found") end
+        else
+            error("no popen")
+        end
+    end)
+    if not ok then
+        vlc.msg.info("[AI Subs] ffprobe not found, skipping audio track detection")
+        return nil
+    end
+
+    local cmd = string.format(
+        '%s -v error -select_streams a -show_entries stream=index,codec_name,channels:stream_tags=language -of csv=p=0 %s 2>&1',
+        ffprobe, shell_quote(media_path)
+    )
+    vlc.msg.info("[AI Subs] probing audio: " .. cmd)
+    local pipe = io.popen(cmd, "r")
+    if not pipe then return nil end
+    local out = pipe:read("*a")
+    pipe:close()
+    if not out or out == "" then return nil end
+
+    local tracks = {}
+    for _line in string.gmatch(out, "[^\r\n]+") do
+        local line = _line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" then
+            -- CSV: index,codec_name,channels,language  (language may be missing)
+            local parts = {}
+            for part in string.gmatch(line .. ",", "([^,]*),") do
+                table.insert(parts, part)
+            end
+            local idx = parts[1] or "?"
+            local codec = parts[2] or "unknown"
+            local chans = parts[3] or "?"
+            local lang = parts[4] or ""
+            if lang == "" then lang = "und" end
+            table.insert(tracks, {idx=idx, codec=codec, chans=chans, lang=lang, raw=line})
+        end
+    end
+    if #tracks == 0 then return nil end
+    return tracks
+end
+
+function refresh_audio_tracks()
+    local media_path, _ = get_media_path()
+    if not media_path then return end
+    local tracks = probe_audio_tracks(media_path)
+    if not tracks or #tracks == 0 then return end
+    if not audio_track_dropdown or not dlg then return end
+
+    -- Repopulate dropdown with detected info.
+    -- VLC Lua dropdown has no clear() API, so we delete and recreate the dropdown.
+    -- Workaround: keep existing 5 entries and add detailed labels if needed via status.
+    -- Better: try to set value labels by re-adding. Since we can't clear, we just log
+    -- and keep the generic entries — user can still select Track N which maps to 0:a:N-1.
+    -- To improve UX, we append detected info to status label.
+    local info = string.format("Detected %d audio track(s): ", #tracks)
+    for i, t in ipairs(tracks) do
+        info = info .. string.format("[%d] %s %sch (%s) ", i, t.codec, t.chans, t.lang)
+    end
+    vlc.msg.info("[AI Subs] " .. info)
+    if status_label then
+        -- Only update if still showing ready message
+        local cur = nil
+        pcall(function() cur = status_label:get_text() end)
+        -- Don't overwrite active transcription status; just log to vlc.msg
+    end
+    -- Attempt to rebuild dropdown if VLC supports deleting single widget:
+    -- Some VLC builds allow dlg:del_widget, but not documented. We try best-effort.
+    pcall(function()
+        -- If we can add more entries, add them with detailed names (id 6+)
+        for i, t in ipairs(tracks) do
+            if i > 5 then
+                local label = string.format("Track %d (%s %sch %s)", i, t.codec, t.chans, t.lang)
+                audio_track_dropdown:add_value(label, i + 1)
+            end
+        end
+    end)
 end
 
 ----------------------------------------------------------------
@@ -198,15 +336,24 @@ function find_script()
     local home = get_home()
     local candidates = {}
 
-    -- Paths to locate the python script, only left the paths where the plugin 
-    -- is copied by the install script to avoid the plugin being detected on multiple paths
+    -- Search for the Python backend. Check installed location first, then dev path.
     if is_windows() then
         local appdata = os.getenv("APPDATA") or (home .. "\\AppData\\Roaming")
         table.insert(candidates, appdata .. "\\vlc-ai-subs\\aisubs.py")
+        -- Also check next to the Lua extension (if Python was copied there)
+        table.insert(candidates, appdata .. "\\vlc\\lua\\extensions\\aisubs.py")
     else
-        -- table.insert(candidates, home .. "/.local/share/vlc-ai-subs/aisubs.py")
+        table.insert(candidates, home .. "/.local/share/vlc-ai-subs/aisubs.py")
         table.insert(candidates, home .. "/Projects/ai-subs/aisubs.py")
+        -- Fallback: check VLC extension dir itself (some installs copy py there)
+        table.insert(candidates, home .. "/.local/share/vlc/lua/extensions/aisubs.py")
+        -- Flatpak / snap user data
+        table.insert(candidates, home .. "/.var/app/org.videolan.VLC/data/vlc-ai-subs/aisubs.py")
+        table.insert(candidates, home .. "/snap/vlc/current/.local/share/vlc-ai-subs/aisubs.py")
     end
+    -- Last resort: try current directory / script-relative (useful for dev)
+    table.insert(candidates, "./aisubs.py")
+    table.insert(candidates, "aisubs.py")
 
     for _, path in ipairs(candidates) do
         local f = io.open(path, "r")
@@ -270,6 +417,8 @@ function start_generation()
     local language  = lang_input:get_text() or "auto"
     local task      = get_task()
     local tmp_file  = get_temp_file()
+    local audio_track   = get_audio_track()
+    local audio_channel = get_audio_channel()
     
     -- Write sentinel so we can detect if Python started writing
     local test_f = io.open(tmp_file, "w")
@@ -291,8 +440,8 @@ function start_generation()
             set_status("Error: cannot write helper file: " .. vbs_file)
             return
         end
-        local raw_cmd = string.format('"%s" -u "%s" "%s" "%s" "%s" "%s" "%s" "%s"',
-            launch_python, launch_script, media_path, model, language, task, tmp_file, tmp_file)
+        local raw_cmd = string.format('"%s" -u "%s" "%s" "%s" "%s" "%s" "%s" "%s" "%s"',
+            launch_python, launch_script, media_path, model, language, task, tmp_file, audio_track, audio_channel)
         vf:write('Set sh = CreateObject("WScript.Shell")\n')
         vf:write('sh.Run "' .. raw_cmd:gsub('"', '""') .. '", 0, False\n')
         vf:close()
@@ -300,7 +449,7 @@ function start_generation()
     else
         -- Unix: run launch.py asynchronously through bash
         local inner_cmd = string.format(
-            '%s -u %s %s %s %s %s %s %s',
+            '%s -u %s %s %s %s %s %s %s %s',
             shell_quote(launch_python),
             shell_quote(launch_script),
             shell_quote(media_path),
@@ -308,7 +457,8 @@ function start_generation()
             shell_quote(language),
             shell_quote(task),
             shell_quote(tmp_file),
-            shell_quote(tmp_file)
+            shell_quote(audio_track),
+            shell_quote(audio_channel)
         )
 
         cmd = string.format(
@@ -322,6 +472,7 @@ function start_generation()
     vlc.msg.info("[AI Subs] python: " .. launch_python)
     vlc.msg.info("[AI Subs] media:  " .. media_path)
     vlc.msg.info("[AI Subs] tmp:    " .. tmp_file)
+    vlc.msg.info("[AI Subs] audio_track: " .. audio_track .. " audio_channel: " .. audio_channel)
 
 
     local pipe, err = io.popen(cmd, "r")

@@ -10,11 +10,14 @@ This script is responsible for:
      deterministic environment.
 
 Usage:
-    python3 launch.py <media_path> <model> <language> <task> <tmp_file>
+    python3 launch.py <media_path> <model> <language> <task> <tmp_file> [audio_track] [audio_channel]
 
 The Lua plugin calls this script instead of constructing complex shell
 commands with LD_LIBRARY_PATH. This keeps all environment logic inside
 Python where it can introspect the interpreter's site-packages layout.
+    audio_track   "auto" or 0,1,2... (ffmpeg 0:a:N)
+    audio_channel "auto"/"mono"/"left"/"right"/"center" or numeric index
+
 """
 
 import sys
@@ -135,7 +138,7 @@ def main():
     if len(sys.argv) < 6:
         emit({
             "type": "error",
-            "msg": "Usage: launch.py <media> <model> <lang> <task> <tmp_file>"
+            "msg": "Usage: launch.py <media> <model> <lang> <task> <tmp_file> [audio_track] [audio_channel]"
         })
         sys.exit(1)
 
@@ -144,6 +147,17 @@ def main():
     language = sys.argv[3]
     task = sys.argv[4]
     tmp_file = sys.argv[5]
+    audio_track = sys.argv[6] if len(sys.argv) > 6 else "auto"
+    audio_channel = sys.argv[7] if len(sys.argv) > 7 else "auto"
+    # Legacy: Lua previously passed tmp_file twice (dup). Detect and ignore.
+    if audio_track and ("/aisubs_" in audio_track or "\\aisubs_" in audio_track or audio_track.endswith(".txt")):
+        # Shift if duplicate tmp was passed — the real track is next arg
+        if len(sys.argv) > 7:
+            audio_track = sys.argv[7] or "auto"
+            audio_channel = sys.argv[8] if len(sys.argv) > 8 else "auto"
+        else:
+            audio_track = "auto"
+            audio_channel = "auto"
 
     # Determine the script directory (where launch.py lives)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -196,6 +210,8 @@ def main():
         language,
         task,
         tmp_file,
+        audio_track,
+        audio_channel,
     ]
 
     emit({
