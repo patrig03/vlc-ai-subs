@@ -25,17 +25,26 @@ local audio_channel_dropdown = nil
 
 -- Polling state (set by start_generation, used by poll_progress)
 local _poll_tmp   = nil
-local _poll_model = nil
 local _poll_tmr   = nil
 local _poll_secs  = 0
-local POLL_US     = 3000000  -- poll every 3 seconds
+local _poll_pos   = 0
+local _poll_count = 0
+local _poll_pid   = nil
+local POLL_US     = 1000000  -- poll every 1 second (was 3s)
 
 ----------------------------------------------------------------
 -- Lifecycle
 ----------------------------------------------------------------
 
 function activate()   create_dialog() end
-function deactivate() if dlg then dlg:delete(); dlg = nil end end
+function deactivate()
+    if _poll_tmr then pcall(function() _poll_tmr:cancel() end) _poll_tmr = nil end
+    if _poll_pid and not is_windows() then
+        pcall(function() os.execute("kill " .. tostring(_poll_pid) .. " 2>/dev/null") end)
+        _poll_pid = nil
+    end
+    if dlg then dlg:delete(); dlg = nil end
+end
 function close()      deactivate() end
 
 function menu() return {"Generate Subtitles"} end
@@ -396,7 +405,7 @@ function find_script()
         table.insert(candidates, appdata .. "\\vlc\\lua\\extensions\\aisubs.py")
     else
         table.insert(candidates, home .. "/.local/share/vlc-ai-subs/aisubs.py")
-        table.insert(candidates, home .. "/Projects/ai-subs/aisubs.py")
+        table.insert(candidates, home .. "/Projects/ai-subs/aisubs.py") -- for dev only, to be removed later
         -- Fallback: check VLC extension dir itself (some installs copy py there)
         table.insert(candidates, home .. "/.local/share/vlc/lua/extensions/aisubs.py")
         -- Flatpak / snap user data
@@ -444,25 +453,26 @@ end
 ---------------------------------------------------------------
 
 function start_generation()
-    
+
     -- Cancel any in-progress transcription
     if _poll_tmr then
         pcall(function() _poll_tmr:cancel() end)
         _poll_tmr = nil
     end
-    
+    _poll_pid = nil
+
     local media_path, err = get_media_path()
     if not media_path then
         set_status("Error: " .. err)
         return
     end
-    
+
     local script = find_script()
     if not script then
         set_status("Error: aisubs.py not found. Run setup.sh first.")
         return
     end
-    
+
     local script_dir = string.match(script, "(.+)[/\\][^/\\]+$") or "."
     local launch_script = script_dir .. (is_windows() and "\\" or "/") .. "launch.py"
     local model     = get_model_name()
@@ -471,21 +481,36 @@ function start_generation()
     local tmp_file  = get_temp_file()
     local audio_track   = get_audio_track()
     local audio_channel = get_audio_channel()
-    
-    -- Write sentinel so we can detect if Python started writing
+
+    -- Create temp file to verify writability; aisubs.py will truncate and rewrite it.
+    -- We intentionally create an empty file (not "init") so that the offset
+    -- stays at 0 even after aisubs.py reopens with "w" (truncate).  poll_progress
+    -- treats empty / "init" as "still starting" for backward compat.
     local test_f = io.open(tmp_file, "w")
     if not test_f then
         set_status("Error: cannot write to temp dir: " .. tmp_file)
         return
     end
-    test_f:write("init\n")
     test_f:close()
 
     local launch_python = find_python_for_launcher(script_dir)
 
-    local cmd
+    vlc.msg.info("[AI Subs] python: " .. launch_python)
+    vlc.msg.info("[AI Subs] media:  " .. media_path)
+    vlc.msg.info("[AI Subs] tmp:    " .. tmp_file)
+    vlc.msg.info("[AI Subs] audio_track: " .. audio_track .. " audio_channel: " .. audio_channel)
+
+    -- Initialise polling state BEFORE spawning so poll_progress has valid offsets
+    _poll_tmp   = tmp_file
+    _poll_secs  = 0
+    _poll_pos   = 0
+    _poll_count = 0
+    _poll_pid   = nil
+
     if is_windows() then
-        -- Windows: use wscript to run launch.py in background
+        -- Windows: use wscript to run launch.py in background (non-blocking).
+        -- wscript with sh.Run(...,0,False) spawns detached and exits immediately,
+        -- so we must NOT do io.popen:read("*a") which would block.
         local vbs_file = string.gsub(tmp_file, "%.txt$", ".vbs")
         local vf = io.open(vbs_file, "w")
         if not vf then
@@ -497,9 +522,15 @@ function start_generation()
         vf:write('Set sh = CreateObject("WScript.Shell")\n')
         vf:write('sh.Run "' .. raw_cmd:gsub('"', '""') .. '", 0, False\n')
         vf:close()
-        cmd = 'wscript.exe /nologo "' .. vbs_file .. '"'
+        local cmd = 'wscript.exe /nologo "' .. vbs_file .. '"'
+        vlc.msg.info("[AI Subs] cmd: " .. cmd)
+        -- os.execute does not capture stdout and returns as soon as wscript spawns
+        local ok = os.execute(cmd)
+        vlc.msg.info("[AI Subs] wscript spawn ok=" .. tostring(ok))
     else
-        -- Unix: run launch.py asynchronously through bash
+        -- Unix: run launch.py fully detached so the popen pipe is not held open
+        -- by the child.  Without >/dev/null the child inherits the pipe fd and
+        -- pipe:read("*a") would block for the entire transcription (the original freeze).
         local inner_cmd = string.format(
             '%s -u %s %s %s %s %s %s %s %s',
             shell_quote(launch_python),
@@ -512,87 +543,126 @@ function start_generation()
             shell_quote(audio_track),
             shell_quote(audio_channel)
         )
-
-        cmd = string.format(
-            'bash -c %s &',
-            shell_quote(inner_cmd)
-        )
-
+        -- Detach all stdio and background; echo $! gives us a pid to optionally kill on cancel.
+        -- stdout/stderr are discarded; aisubs.py writes JSON to tmp_file via _out_file.
+        local cmd = inner_cmd .. " > /dev/null 2>&1 < /dev/null & echo $!"
         vlc.msg.info("[AI Subs] cmd: " .. cmd)
+        local pipe = io.popen(cmd, "r")
+        if not pipe then
+            vlc.msg.err("[AI Subs] io.popen FAILED for detached cmd")
+            set_status("Error: failed to spawn transcription process")
+            return
+        end
+        -- This read returns immediately (<5ms) because child's stdout is redirected to /dev/null
+        local pid = pipe:read("*l")
+        pipe:close()
+        if pid then pid = pid:gsub("%s+", "") end
+        if pid and pid:match("^%d+$") then
+            _poll_pid = pid
+            vlc.msg.info("[AI Subs] spawned pid=" .. pid)
+        else
+            vlc.msg.info("[AI Subs] spawned (no pid captured)")
+        end
     end
-    
-    vlc.msg.info("[AI Subs] python: " .. launch_python)
-    vlc.msg.info("[AI Subs] media:  " .. media_path)
-    vlc.msg.info("[AI Subs] tmp:    " .. tmp_file)
-    vlc.msg.info("[AI Subs] audio_track: " .. audio_track .. " audio_channel: " .. audio_channel)
 
-
-    local pipe, err = io.popen(cmd, "r")
-
-    if not pipe then
-        vlc.msg.err("[AI Subs] io.popen FAILED: " .. tostring(err))
-        set_status("popen failed: " .. tostring(err))
-        return
-    end
-
-    vlc.msg.info("[AI Subs] io.popen succeeded")
-
-    local output = pipe:read("*a")
-
-    vlc.msg.info("[AI Subs] Process output:")
-    vlc.msg.info(output ~= "" and output or "(no output)")
-
-    local ok, reason, code = pipe:close()
-
-    vlc.msg.info(string.format(
-        "[AI Subs] Process finished: ok=%s reason=%s code=%s",
-        tostring(ok),
-        tostring(reason),
-        tostring(code)
-    ))
-
-    -- Poll tmp_file every 3 s; VLC's thread stays free the whole time
-    _poll_tmp   = tmp_file
-    _poll_secs  = 0
-    set_status("Transcribing... please wait")
+    -- VLC's main thread stays free — polling is driven by vlc.timer
+    set_status("Transcribing... please wait (0s)")
     _poll_tmr = vlc.timer(poll_progress)
     _poll_tmr:schedule(POLL_US)
 end
 
 ----------------------------------------------------------------
 -- Polling callback — called by vlc.timer every POLL_US microseconds
+-- Incremental tail: only reads bytes appended since last poll, so we can
+-- surface live status/sub counts without re-reading the whole file.
 ----------------------------------------------------------------
 
 function poll_progress()
-    _poll_secs = _poll_secs + (POLL_US / 1000000)
+    -- Robust polling: never let an exception kill the timer chain.
+    -- This version reads the whole tmp file each tick (like the original)
+    -- but surfaces live status/segment count.
+    local ok, err = pcall(function()
+        if not _poll_tmp then
+            vlc.msg.warn("[AI Subs] poll: no _poll_tmp")
+            return
+        end
+        _poll_secs = _poll_secs + (POLL_US / 1000000)
+        vlc.msg.info(string.format("[AI Subs] poll tick %ds count=%d tmp=%s", _poll_secs, _poll_count or 0, tostring(_poll_tmp)))
 
-    local f = io.open(_poll_tmp, "r")
-    if not f then
-        -- Temp file gone — shouldn't happen; keep waiting
-        set_status(string.format("Transcribing... %ds", _poll_secs))
-        _poll_tmr:schedule(POLL_US)
-        return
+        local f = io.open(_poll_tmp, "r")
+        if not f then
+            vlc.msg.warn("[AI Subs] poll: cannot open " .. tostring(_poll_tmp))
+            if _poll_secs > 30 then
+                set_status("Error: temp file lost. Check VLC logs.")
+                if _poll_tmr then pcall(function() _poll_tmr:cancel() end) _poll_tmr=nil end
+                _poll_tmp = nil
+                return
+            end
+            set_status(string.format("Loading model / starting... %ds", _poll_secs))
+            return
+        end
+
+        local last_status = nil
+        local last_line = nil
+        local has_data = false
+        local saw_done = false
+        local saw_error = false
+        local seg_in_file = 0
+
+        for line in f:lines() do
+            last_line = line
+            if line ~= "" and line ~= "init" then
+                has_data = true
+                local d = parse_json(line)
+                if d then
+                    if d.type == "status" and d.msg then
+                        last_status = d.msg
+                    elseif d.type == "sub" then
+                        seg_in_file = seg_in_file + 1
+                    elseif d.type == "error" then
+                        saw_error = true
+                    elseif d.type == "done" then
+                        saw_done = true
+                        if d.segments then seg_in_file = d.segments end
+                    end
+                end
+            end
+        end
+        f:close()
+
+        -- Keep incremental count in sync (use max so we never go backwards)
+        if seg_in_file > _poll_count then _poll_count = seg_in_file end
+        -- Also update from last_status if present
+        vlc.msg.info(string.format("[AI Subs] poll last_status=%s segs=%d done=%s err=%s", tostring(last_status), _poll_count, tostring(saw_done), tostring(saw_error)))
+
+        if saw_error or saw_done then
+            if _poll_tmr then pcall(function() _poll_tmr:cancel() end) _poll_tmr=nil end
+            _poll_pid = nil
+            process_results(_poll_tmp)
+            return
+        end
+
+        if not has_data then
+            set_status(string.format("Loading model / starting... %ds", _poll_secs))
+        elseif last_status then
+            set_status(string.format("%s (%ds) — %d segments", last_status, _poll_secs, _poll_count))
+        elseif _poll_count > 0 then
+            set_status(string.format("Transcribing... %d segments (%ds)", _poll_count, _poll_secs))
+        else
+            set_status(string.format("Transcribing... %ds", _poll_secs))
+        end
+    end)
+
+    if not ok then
+        vlc.msg.err("[AI Subs] poll_progress exception: " .. tostring(err))
+        pcall(function() set_status("Poll error: " .. tostring(err)) end)
     end
 
-    local last_line = nil
-    for line in f:lines() do last_line = line end
-    f:close()
-
-    if not last_line or last_line == "init" then
-        -- Python hasn't written output yet
-        set_status(string.format("Loading model / starting... %ds", _poll_secs))
-        _poll_tmr:schedule(POLL_US)
-        return
-    end
-
-    local d = parse_json(last_line)
-    if d and (d.type == "done" or d.type == "error") then
-        -- Python finished — process results
-        _poll_tmr = nil
-        process_results(_poll_tmp)
-    else
-        set_status(string.format("Transcribing with... %ds", _poll_secs))
-        _poll_tmr:schedule(POLL_US)
+    if _poll_tmr and _poll_tmp then
+        local sok, serr = pcall(function() _poll_tmr:schedule(POLL_US) end)
+        if not sok then
+            vlc.msg.err("[AI Subs] timer reschedule failed: " .. tostring(serr))
+        end
     end
 end
 
@@ -604,6 +674,7 @@ function process_results(tmp_file)
     local f = io.open(tmp_file, "r")
     if not f then
         set_status("Error: Whisper produced no output. Check VLC logs.")
+        _poll_tmp = nil
         return
     end
 
@@ -617,6 +688,10 @@ function process_results(tmp_file)
                 set_status("Error: " .. (d.msg or "unknown"))
                 f:close()
                 pcall(function() os.remove(tmp_file) end)
+                pcall(function() os.remove(tmp_file:gsub("%.txt$",".vbs")) end)
+                pcall(function() os.remove(tmp_file..".log") end)
+                _poll_tmp = nil
+                _poll_pid = nil
                 return
             elseif d.type == "sub" then
                 seg_count = seg_count + 1
@@ -628,6 +703,10 @@ function process_results(tmp_file)
     end
     f:close()
     pcall(function() os.remove(tmp_file) end)
+    pcall(function() os.remove(tmp_file:gsub("%.txt$",".vbs")) end)
+    pcall(function() os.remove(tmp_file..".log") end)
+    _poll_tmp = nil
+    _poll_pid = nil
 
     if not srt_path then
         set_status("Error: transcription failed. Check VLC logs for details.")
