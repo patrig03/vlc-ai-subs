@@ -48,6 +48,16 @@ Then:
 |------|-------------|
 | **Generate & Load SRT** | Full transcription runs first, then the `.srt` file is loaded as a proper subtitle track. Perfect sync on replay. |
 
+Data flow:
+
+```
+VLC (aisubs.lua) → launch.py → aisubs.py (faster-whisper) → .srt + JSON
+     ↕ polling via temp file and vlc.timer
+```
+
+`launch.py` builds a clean environment (LD_LIBRARY_PATH for CUDA, venv PATH) and spawns `aisubs.py`.
+`aisubs.py` streams `{"type":"status"|"sub"|"done"|"error"}` JSON lines to stdout and to a temp file that the Lua frontend polls.
+
 ## Models
 
 | Model | Speed | Accuracy | RAM | Download |
@@ -62,15 +72,82 @@ Then:
 
 - **Language** — `auto` for detection, or a code like `en`, `es`, `fr`, `hi`, `ja`, `zh`, etc.
 - **Task** — `Transcribe` (same language) or `Translate to English`
+- **Audio Track** — `auto` (first track) or numeric index `0,1,2…` (maps to `ffmpeg -map 0:a:N`)
+- **Audio Channel** — `auto` (mix to mono), `mono`, `left`, `right`, `center`, or numeric channel index
 
-## Files
+## Architecture
+
+The codebase is split by responsibility so each file has a single purpose:
+
+### Python backend (`src/aisubs/`)
+
+| Module | Responsibility |
+|--------|---------------|
+| `constants.py` | Tunable segmentation constants (durations, char limits) |
+| `models.py` | `Word` and `SubtitleSegment` dataclasses |
+| `scoring.py` | Punctuation / silence scoring and duration/length penalties |
+| `segmentation.py` | Boundary search, segment grouping, timing refinement |
+| `formatting.py` | SRT timestamp formatting and line wrapping |
+| `audio.py` | `ffmpeg` extraction for track/channel selection |
+| `transcription.py` | `faster-whisper` model loading and streaming |
+| `protocol.py` | JSON-line emit to stdout + temp file |
+| `srt_writer.py` | SRT assembly helpers |
+| `cli.py` | Argument parsing and orchestration (`main()`) |
+
+### Launcher (`src/launcher/`)
+
+| Module | Responsibility |
+|--------|---------------|
+| `python.py` | Locate bundled `venv` Python and `site-packages` |
+| `cuda.py` | Discover NVIDIA libs and build `LD_LIBRARY_PATH` / `PATH` |
+| `cli.py` | CLI entry that wires Python + env + `aisubs.py` spawn |
+
+### VLC extension (`lua/`)
+
+| Module | Responsibility |
+|--------|---------------|
+| `helpers.lua` | `shell_quote`, `is_windows`, `get_temp_file`, `parse_json`, `set_status` |
+| `compat.lua` | VLC 3.x/4.x compatibility (`get_input_item`, `add_subtitle_track`, `get_media_path`) |
+| `audio.lua` | `ffprobe` track probing and `get_audio_track`/`get_audio_channel` |
+| `dialog.lua` | Dialog creation and widget wiring |
+| `polling.lua` | Background spawn, `poll_progress` timer, and result processing |
+
+Root shims (`aisubs.py`, `launch.py`, `aisubs.lua`, `boundaries.py`) are thin wrappers that preserve the public paths VLC and existing imports expect.
+
+## Project Structure
 
 ```
 vlc-ai-subs/
-├── aisubs.lua           # VLC Lua extension (the UI)
-├── aisubs.py            # Python Whisper backend
-├── setup.sh             # Setup & install (Linux / macOS)
-├── setup.bat            # Setup & install (Windows)
+├── aisubs.lua              # VLC extension entry (loads lua/*.lua)
+├── aisubs.py               # Python backend entry (imports src/aisubs/cli.py)
+├── launch.py               # Launcher entry (imports src/launcher/cli.py)
+├── boundaries.py           # Backwards-compat shim re-exporting src/aisubs/*
+├── lua/
+│   ├── helpers.lua
+│   ├── compat.lua
+│   ├── audio.lua
+│   ├── dialog.lua
+│   └── polling.lua
+├── src/
+│   ├── aisubs/
+│   │   ├── __init__.py
+│   │   ├── constants.py
+│   │   ├── models.py
+│   │   ├── scoring.py
+│   │   ├── segmentation.py
+│   │   ├── formatting.py
+│   │   ├── audio.py
+│   │   ├── transcription.py
+│   │   ├── protocol.py
+│   │   ├── srt_writer.py
+│   │   └── cli.py
+│   └── launcher/
+│       ├── __init__.py
+│       ├── python.py
+│       ├── cuda.py
+│       └── cli.py
+├── setup.sh                # Setup & install (Linux / macOS)
+├── setup.bat               # Setup & install (Windows)
 ├── LICENSE
 └── README.md
 ```
@@ -86,17 +163,36 @@ If the setup script doesn't work for your system:
    venv\Scripts\pip.exe install faster-whisper # Windows
    ```
 
-2. Copy `aisubs.lua` to your VLC extensions folder:
-   - **Linux**: `~/.local/share/vlc/lua/extensions/`
-   - **macOS**: `~/Library/Application Support/org.videolan.vlc/lua/extensions/`
-   - **Windows**: `%APPDATA%\vlc\lua\extensions\`
+2. Copy extension and Python backend:
+   - **Lua** — `aisubs.lua` + `lua/` folder to your VLC extensions folder:
+     - **Linux**: `~/.local/share/vlc/lua/extensions/`
+     - **macOS**: `~/Library/Application Support/org.videolan.vlc/lua/extensions/`
+     - **Windows**: `%APPDATA%\vlc\lua\extensions\`
+   - **Python** — `aisubs.py`, `launch.py`, `boundaries.py`, `src/` (and `venv/` if present) to the data folder:
+     - **Linux**: `~/.local/share/vlc-ai-subs/`
+     - **macOS**: `~/Library/Application Support/vlc-ai-subs/`
+     - **Windows**: `%APPDATA%\vlc-ai-subs\`
+     - Flatpak: `~/.var/app/org.videolan.VLC/data/vlc-ai-subs/`
 
 3. Restart VLC.
 
-To update just the VLC extension without reinstalling Python deps:
+To update just the VLC extension + Python backend without reinstalling Python deps:
 ```bash
 ./setup.sh --install        # Linux/macOS
 setup.bat --install         # Windows
+```
+
+## Development
+
+```bash
+# Python syntax check (no Whisper model needed)
+python -m py_compile src/aisubs/*.py src/launcher/*.py aisubs.py launch.py boundaries.py
+
+# Lua syntax check
+luac -p aisubs.lua && luac -p lua/*.lua
+
+# Run transcription directly
+python aisubs.py /path/to/video.mp4 base auto transcribe
 ```
 
 ## License

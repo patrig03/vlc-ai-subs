@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 SRC="$SCRIPT_DIR/aisubs.lua"
+LUA_DIR="$SCRIPT_DIR/lua"
+SRC_DIR="$SCRIPT_DIR/src"
 INSTALLED=0
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -27,15 +29,48 @@ install_to() {
     local needs_sudo="${2:-false}"
 
     if [ "$needs_sudo" = "true" ]; then
-        # System paths: only install if directory already exists (avoid sudo mkdir)
         if [ -d "$dir" ]; then
-            sudo cp "$SRC" "$dir/aisubs.lua" 2>/dev/null && ok "$dir" && INSTALLED=1
+            sudo cp "$SRC" "$dir/aisubs.lua" 2>/dev/null && ok "$dir (aisubs.lua)" && INSTALLED=1
+            # Also try to install lua/ submodules if present
+            if [ -d "$LUA_DIR" ]; then
+                sudo mkdir -p "$dir/lua" 2>/dev/null || true
+                sudo cp "$LUA_DIR"/*.lua "$dir/lua/" 2>/dev/null && ok "$dir/lua/" || true
+            fi
         fi
     else
-        # User paths: create directory if needed, then install
         mkdir -p "$dir" 2>/dev/null || return
-        cp "$SRC" "$dir/aisubs.lua" && ok "$dir" && INSTALLED=1
+        cp "$SRC" "$dir/aisubs.lua" && ok "$dir (aisubs.lua)" && INSTALLED=1
+        if [ -d "$LUA_DIR" ]; then
+            mkdir -p "$dir/lua" 2>/dev/null || true
+            cp "$LUA_DIR"/*.lua "$dir/lua/" 2>/dev/null && ok "$dir/lua/" || true
+        fi
     fi
+}
+
+install_python_backend() {
+    local target="$DATA_DIR"
+    echo ""
+    echo "Installing Python backend to $target ..."
+    mkdir -p "$target" 2>/dev/null || warn "Could not create $target"
+    # Core entry points
+    for f in aisubs.py launch.py boundaries.py; do
+        if [ -f "$SCRIPT_DIR/$f" ]; then
+            cp "$SCRIPT_DIR/$f" "$target/$f" 2>/dev/null && ok "$target/$f" || warn "Failed to copy $f"
+        fi
+    done
+    # Package directory
+    if [ -d "$SRC_DIR" ]; then
+        mkdir -p "$target/src" 2>/dev/null || true
+        cp -r "$SRC_DIR"/* "$target/src/" 2>/dev/null && ok "$target/src/" || warn "Failed to copy src/"
+        # Ensure src is a package (already has __init__.py)
+    fi
+    # venv: if project venv exists and target venv missing, copy it
+    if [ -d "$VENV_DIR" ] && [ ! -d "$target/venv" ]; then
+        info "Copying venv to $target/venv (this may take a moment)..."
+        cp -r "$VENV_DIR" "$target/venv" 2>/dev/null && ok "venv copied" || warn "Could not copy venv — will be created on next run"
+    fi
+    # If no venv at target and this is full setup, let the venv creation step handle it
+    # (VENV_DIR already handled earlier; target venv will be created if needed by launcher fallback)
 }
 
 # ── Detect OS ────────────────────────────────────────────────
@@ -50,6 +85,15 @@ detect_os() {
 }
 
 OS=$(detect_os)
+
+# Data dir where Python backend lives (used by Lua's find_script)
+if [ "$OS" = "macos" ]; then
+    DATA_DIR="$HOME/Library/Application Support/vlc-ai-subs"
+else
+    DATA_DIR="$HOME/.local/share/vlc-ai-subs"
+fi
+# Flatpak override
+[ -d "$HOME/.var/app/org.videolan.VLC" ] && DATA_DIR="$HOME/.var/app/org.videolan.VLC/data/vlc-ai-subs"
 
 # ── Check prerequisites ─────────────────────────────────────
 
@@ -126,6 +170,7 @@ install_vlc_extension() {
 
 if [ "${1:-}" = "--install" ]; then
     install_vlc_extension
+    install_python_backend
     echo "Done! Restart VLC and check View > AI Subs Generator"
     exit 0
 fi
@@ -183,8 +228,9 @@ info "Installing faster-whisper (this may take a few minutes)..."
 "$VENV_PIP" install --quiet faster-whisper
 "$VENV_PYTHON" -c "from faster_whisper import WhisperModel; print('  ✓ faster-whisper installed')"
 
-# 5. Install VLC extension
+# 5. Install VLC extension + Python backend
 install_vlc_extension
+install_python_backend
 
 echo ""
 echo "  Setup complete!"
