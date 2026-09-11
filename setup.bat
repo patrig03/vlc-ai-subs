@@ -66,6 +66,65 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM 3b. Install CUDA dependencies if GPU is available
+echo   Checking for CUDA GPU...
+set "CUDA_AVAILABLE=0"
+where nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    nvidia-smi >nul 2>&1
+    if not errorlevel 1 (
+        nvidia-smi --query-gpu=name --format=csv,noheader 2>nul | findstr /r "." >nul 2>&1
+        if not errorlevel 1 set "CUDA_AVAILABLE=1"
+    )
+)
+REM Fallback: check via ctranslate2
+if "%CUDA_AVAILABLE%"=="0" (
+    "%VENV_DIR%\Scripts\python.exe" -c "import ctranslate2; import sys; sys.exit(0 if ctranslate2.get_cuda_device_count() > 0 else 1)" >nul 2>&1
+    if not errorlevel 1 set "CUDA_AVAILABLE=1"
+)
+
+if "%CUDA_AVAILABLE%"=="1" (
+    echo   CUDA GPU detected — ensuring CUDA libraries...
+    "%VENV_DIR%\Scripts\pip.exe" show nvidia-cublas-cu12 >nul 2>&1
+    if errorlevel 1 (
+        echo   Installing nvidia-cublas-cu12...
+        "%VENV_DIR%\Scripts\pip.exe" install --quiet "nvidia-cublas-cu12"
+        if errorlevel 1 echo   Warning: Failed to install nvidia-cublas-cu12
+    ) else (
+        echo   nvidia-cublas-cu12 already installed.
+    )
+    "%VENV_DIR%\Scripts\pip.exe" show nvidia-cuda-nvrtc-cu12 >nul 2>&1
+    if errorlevel 1 (
+        echo   Installing nvidia-cuda-nvrtc-cu12...
+        "%VENV_DIR%\Scripts\pip.exe" install --quiet "nvidia-cuda-nvrtc-cu12"
+    ) else (
+        echo   nvidia-cuda-nvrtc-cu12 already installed.
+    )
+    "%VENV_DIR%\Scripts\pip.exe" show nvidia-cuda-runtime-cu12 >nul 2>&1
+    if errorlevel 1 (
+        echo   Installing nvidia-cuda-runtime-cu12...
+        "%VENV_DIR%\Scripts\pip.exe" install --quiet "nvidia-cuda-runtime-cu12"
+    ) else (
+        echo   nvidia-cuda-runtime-cu12 already installed.
+    )
+    "%VENV_DIR%\Scripts\pip.exe" show nvidia-cudnn-cu12 >nul 2>&1
+    if errorlevel 1 (
+        echo   Installing nvidia-cudnn-cu12 (optional, may take a minute)...
+        "%VENV_DIR%\Scripts\pip.exe" install --quiet "nvidia-cudnn-cu12" >nul 2>&1
+        if errorlevel 1 echo   Warning: nvidia-cudnn-cu12 install failed — continuing without it
+    ) else (
+        echo   nvidia-cudnn-cu12 already installed.
+    )
+    "%VENV_DIR%\Scripts\python.exe" -c "import ctranslate2; assert ctranslate2.get_cuda_device_count() > 0" >nul 2>&1
+    if not errorlevel 1 (
+        echo   CUDA libraries verified.
+    ) else (
+        echo   Warning: CUDA libraries installed but GPU not yet usable — will fallback to CPU
+    )
+) else (
+    echo   No CUDA GPU detected — skipping CUDA libraries (CPU mode)
+)
+
 REM 4. Install VLC extension + Python backend
 :install_vlc
 echo.

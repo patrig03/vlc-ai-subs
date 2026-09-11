@@ -228,6 +228,86 @@ info "Installing faster-whisper (this may take a few minutes)..."
 "$VENV_PIP" install --quiet faster-whisper
 "$VENV_PYTHON" -c "from faster_whisper import WhisperModel; print('  ✓ faster-whisper installed')"
 
+# 4b. Install CUDA dependencies if GPU is available
+#    faster-whisper itself does not declare nvidia libs, but ctranslate2 with CUDA needs them.
+#    Without them, users on CUDA hardware see: "Library libcublas.so.12 is not found".
+info "Checking for CUDA GPU..."
+CUDA_AVAILABLE="false"
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q .; then
+        CUDA_AVAILABLE="true"
+    fi
+fi
+# Fallback: check via ctranslate2 if nvidia-smi not available (e.g. in containers)
+if [ "$CUDA_AVAILABLE" = "false" ]; then
+    if "$VENV_PYTHON" -c "import ctranslate2; import sys; sys.exit(0 if ctranslate2.get_cuda_device_count() > 0 else 1)" 2>/dev/null; then
+        CUDA_AVAILABLE="true"
+    fi
+fi
+# Also consider system CUDA paths
+if [ "$CUDA_AVAILABLE" = "false" ] && { [ -d "/usr/local/cuda" ] || [ -d "/opt/cuda" ]; }; then
+    # Only treat as available if driver is likely present (nvidia module)
+    if lsmod 2>/dev/null | grep -qi nvidia || [ -e "/proc/driver/nvidia/version" ]; then
+        CUDA_AVAILABLE="true"
+    fi
+fi
+
+if [ "$CUDA_AVAILABLE" = "true" ]; then
+    info "CUDA GPU detected — ensuring CUDA libraries..."
+    # Core libs required for ctranslate2 4.8.1 (CUDA 12.4): cublas + nvrtc + runtime
+    # Use --quiet but don't hide errors; retry once on failure
+    if ! "$VENV_PIP" show nvidia-cublas-cu12 &>/dev/null; then
+        info "Installing nvidia-cublas-cu12 ..."
+        "$VENV_PIP" install --quiet "nvidia-cublas-cu12" || warn "Failed to install nvidia-cublas-cu12 (will fallback to CPU)"
+    else
+        ok "nvidia-cublas-cu12 already installed"
+    fi
+    if ! "$VENV_PIP" show nvidia-cuda-nvrtc-cu12 &>/dev/null; then
+        info "Installing nvidia-cuda-nvrtc-cu12 ..."
+        "$VENV_PIP" install --quiet "nvidia-cuda-nvrtc-cu12" || warn "Failed to install nvidia-cuda-nvrtc-cu12"
+    else
+        ok "nvidia-cuda-nvrtc-cu12 already installed"
+    fi
+    if ! "$VENV_PIP" show nvidia-cuda-runtime-cu12 &>/dev/null; then
+        info "Installing nvidia-cuda-runtime-cu12 ..."
+        "$VENV_PIP" install --quiet "nvidia-cuda-runtime-cu12" || warn "Failed to install nvidia-cuda-runtime-cu12"
+    else
+        ok "nvidia-cuda-runtime-cu12 already installed"
+    fi
+    # cudnn is large (~0.7-1GB) and not strictly required for tiny/base; install if not present but don't fail
+    if ! "$VENV_PIP" show nvidia-cudnn-cu12 &>/dev/null; then
+        info "Installing nvidia-cudnn-cu12 (optional, may take a minute)..."
+        "$VENV_PIP" install --quiet "nvidia-cudnn-cu12" 2>&1 | tail -n 5 || warn "nvidia-cudnn-cu12 install failed — continuing without it (CPU fallback available)"
+    else
+        ok "nvidia-cudnn-cu12 already installed"
+    fi
+    # Verify libcublas can be found via ctranslate2 or direct load
+    if "$VENV_PYTHON" -c "import ctranslate2; assert ctranslate2.get_cuda_device_count() > 0" 2>/dev/null; then
+        ok "CUDA libraries verified (GPU accessible via ctranslate2)"
+    else
+        warn "CUDA libraries installed but GPU not yet usable — transcription will fallback to CPU if needed"
+        info "You may need to reboot or reinstall NVIDIA drivers if GPU should be available"
+    fi
+    # Quick check that libcublas.so.12 is discoverable
+    if "$VENV_PYTHON" -c "
+import site, os
+sp = site.getsitepackages()[0]
+import pathlib
+found = False
+for root, dirs, files in os.walk(os.path.join(sp, 'nvidia')):
+    if 'libcublas.so.12' in files or 'libcublas.so.13' in files:
+        found = True
+        break
+import sys; sys.exit(0 if found else 1)
+" 2>/dev/null; then
+        ok "libcublas found in venv"
+    else
+        warn "libcublas not found in venv — check pip install logs"
+    fi
+else
+    info "No CUDA GPU detected — skipping CUDA libraries (CPU mode)"
+fi
+
 # 5. Install VLC extension + Python backend
 install_vlc_extension
 install_python_backend

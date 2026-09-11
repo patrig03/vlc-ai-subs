@@ -35,8 +35,19 @@ def _parse_args(argv: list[str]) -> dict:
         try:
             f = open(out_file_arg, "w", encoding="utf-8", buffering=1)
             set_output_file(f)
-        except Exception:
-            pass  # stdout-only mode
+        except Exception as e:
+            # Protocol file is critical for VLC IPC — stdout is /dev/null when
+            # spawned from VLC, so failure must be visible.
+            import traceback
+
+            # Try to emit to stderr (captured via log redirection) and stdout
+            try:
+                emit({"type": "error", "msg": f"Cannot open output file {out_file_arg}: {e}\n{traceback.format_exc()}"})
+            except Exception:
+                pass
+            sys.stderr.write(f"Cannot open output file {out_file_arg}: {e}\n{traceback.format_exc()}\n")
+            sys.stderr.flush()
+            sys.exit(1)
 
     if len(argv) > 6:
         audio_track = argv[6] or "auto"
@@ -185,11 +196,56 @@ def main(argv: list[str] | None = None) -> None:
     base, _ = os.path.splitext(media_path)
     srt_path = base + ".srt"
 
+    if count == 0:
+        emit({"type": "status", "msg": "Warning: 0 segments produced — audio may be silent or unsupported. Writing empty SRT."})
+
+    # Ensure we flush protocol file before attempting SRT write so Lua sees status
+    from . import protocol as _proto_pre
+
+    if _proto_pre._out_file:
+        try:
+            _proto_pre._out_file.flush()
+        except Exception:
+            pass
+
     try:
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(srt_lines))
+        emit({"type": "status", "msg": f"SRT written: {srt_path} ({count} segments)"})
     except Exception as e:
-        emit({"type": "error", "msg": f"Could not write SRT: {e}"})
+        import traceback
+        import tempfile
+
+        tb = traceback.format_exc()
+        # Report permissions / path diagnostics
+        dir_path = os.path.dirname(os.path.abspath(srt_path)) or "."
+        try:
+            writable = os.access(dir_path, os.W_OK)
+        except Exception:
+            writable = False
+        try:
+            dir_listing = str(os.listdir(dir_path)[:10]) if os.path.isdir(dir_path) else "not a dir"
+        except Exception as ex:
+            dir_listing = f"list error: {ex}"
+        err_detail = (
+            f"Could not write SRT: {e}\n"
+            f"Target: {srt_path}\n"
+            f"Dir: {dir_path} writable={writable}\n"
+            f"Dir sample: {dir_listing}\n"
+            f"{tb}"
+        )
+        # First failure is recoverable — emit as status so polling doesn't treat it as fatal if fallback succeeds
+        emit({"type": "status", "msg": err_detail})
+        # Fallback: try writing to temp directory so user still gets subtitles
+        fallback = os.path.join(tempfile.gettempdir(), os.path.basename(srt_path))
+        try:
+            with open(fallback, "w", encoding="utf-8") as ff:
+                ff.write("\n".join(srt_lines))
+            emit({"type": "status", "msg": f"SRT fallback written to: {fallback} (original target not writable)"})
+            emit({"type": "done", "segments": count, "srt_path": fallback})
+            sys.exit(0)
+        except Exception as fe:
+            emit({"type": "error", "msg": f"Fallback SRT also failed: {fe}\n{traceback.format_exc()}\nOriginal error: {err_detail}"})
         sys.exit(1)
 
     emit({"type": "done", "segments": count, "srt_path": srt_path})

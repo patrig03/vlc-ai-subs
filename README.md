@@ -7,7 +7,6 @@ VLC media player plugin that generates subtitles using OpenAI Whisper — works 
 - **Any language** — Auto-detection or specify a language code
 - **Translation** — Translate any language to English subtitles
 - **5 model sizes** — From `tiny` (fastest) to `large` (most accurate)
-- **Quiet voice detection** — Tuned to catch whispers, husky voices, and low speech
 - **VLC 3.x & 4.x** — Compatible with both versions
 - **Cross-platform** — Windows, macOS, and Linux (native, snap, flatpak)
 
@@ -42,21 +41,7 @@ Then:
 - VLC 3.x or 4.x
 - ~150 MB disk space for the `base` model (downloaded on first use)
 
-## How It Works
-
-| Mode | Description |
-|------|-------------|
-| **Generate & Load SRT** | Full transcription runs first, then the `.srt` file is loaded as a proper subtitle track. Perfect sync on replay. |
-
-Data flow:
-
-```
-VLC (aisubs.lua) → launch.py → aisubs.py (faster-whisper) → .srt + JSON
-     ↕ polling via temp file and vlc.timer
-```
-
-`launch.py` builds a clean environment (LD_LIBRARY_PATH for CUDA, venv PATH) and spawns `aisubs.py`.
-`aisubs.py` streams `{"type":"status"|"sub"|"done"|"error"}` JSON lines to stdout and to a temp file that the Lua frontend polls.
+Dedicated gpu is recommended for models above `base`. Setup script should auto detect cuda and install the necessary libraries. If cuda is not available -> fallback to cpu. Models are downloaded automatically on first use.
 
 ## Models
 
@@ -194,6 +179,10 @@ luac -p aisubs.lua && luac -p lua/*.lua
 # Run transcription directly
 python aisubs.py /path/to/video.mp4 base auto transcribe
 ```
+
+## Credits
+
+Original idea and initial code by [voidrlm](https://github.com/voidrlm/vlc-ai-subs.git)
 
 ## License
 

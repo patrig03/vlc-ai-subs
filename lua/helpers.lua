@@ -47,6 +47,17 @@ function get_temp_file()
         -- fallback: use math.random if time not available
         t = math.random(1000000)
     end
+    -- Add random suffix to avoid collisions within same second
+    local rnd = 0
+    if math and math.random then
+        -- seed once
+        if not _ai_subs_rand_seeded then
+            if os and os.time then pcall(function() math.randomseed(os.time() + math.random(9999)) end) end
+            _ai_subs_rand_seeded = true
+        end
+        rnd = math.random(1000, 9999)
+    end
+    local suffix = tostring(t) .. "_" .. tostring(rnd)
     if is_windows() then
         if os and os.getenv then
             tmp = os.getenv("TEMP") or os.getenv("TMP")
@@ -57,13 +68,13 @@ function get_temp_file()
         if tmp == "" or tmp == "\\AppData\\Local\\Temp" then
             tmp = "/tmp"
         end
-        return tmp .. "\\aisubs_" .. tostring(t) .. ".txt"
+        return tmp .. "\\aisubs_" .. suffix .. ".txt"
     else
         if os and os.getenv then
             tmp = os.getenv("TMPDIR")
         end
         if not tmp or tmp == "" then tmp = "/tmp" end
-        return tmp .. "/aisubs_" .. tostring(t) .. ".txt"
+        return tmp .. "/aisubs_" .. suffix .. ".txt"
     end
 end
 
@@ -72,15 +83,76 @@ function parse_json(str)
     local j = string.match(str, "%b{}")
     if not j then return nil end
     local r = {}
-    for k, v in string.gmatch(j, '"([^"]+)"%s*:%s*"(.-)"') do
-        v = string.gsub(v, "\\n", "\n")
-        v = string.gsub(v, "\\t", "\t")
-        v = string.gsub(v, '\\"', '"')
-        v = string.gsub(v, "\\\\", "\\")
-        r[k] = v
+    -- Robust parser: handles escaped strings (\", \\, \n, \t, \/, \r, \b, \uXXXX)
+    local i = 1
+    local n = #j
+    while i <= n do
+        local ks, ke, key = j:find('"([^"]+)"%s*:%s*', i)
+        if not ks then break end
+        i = ke + 1
+        if i > n then break end
+        local c = j:sub(i, i)
+        if c == '"' then
+            -- String value
+            i = i + 1
+            local buf = {}
+            while i <= n do
+                local ch = j:sub(i, i)
+                if ch == "\\" then
+                    local nc = j:sub(i + 1, i + 1)
+                    if nc == "n" then table.insert(buf, "\n")
+                    elseif nc == "t" then table.insert(buf, "\t")
+                    elseif nc == "r" then table.insert(buf, "\r")
+                    elseif nc == "b" then table.insert(buf, "\b")
+                    elseif nc == "f" then table.insert(buf, "\f")
+                    elseif nc == '"' then table.insert(buf, '"')
+                    elseif nc == "\\" then table.insert(buf, "\\")
+                    elseif nc == "/" then table.insert(buf, "/")
+                    elseif nc == "u" then
+                        local hex = j:sub(i + 2, i + 5)
+                        local code = tonumber(hex, 16)
+                        if code and code < 128 then
+                            table.insert(buf, string.char(code))
+                        elseif code then
+                            -- best-effort placeholder for non-ascii
+                            table.insert(buf, "?")
+                        else
+                            table.insert(buf, "\\u" .. hex)
+                        end
+                        i = i + 4 -- extra 4 consumed below
+                    else
+                        -- Unknown escape, keep literal
+                        table.insert(buf, nc)
+                    end
+                    i = i + 2
+                elseif ch == '"' then
+                    i = i + 1
+                    break
+                else
+                    table.insert(buf, ch)
+                    i = i + 1
+                end
+            end
+            r[key] = table.concat(buf)
+        else
+            -- Number / boolean / null
+            local ns, ne, num = j:find("^%s*([%d%.%-eE+]+)", i)
+            if ns then
+                r[key] = tonumber(num)
+                i = ne + 1
+            else
+                if j:sub(i, i + 3) == "true" then r[key] = true; i = i + 4
+                elseif j:sub(i, i + 4) == "false" then r[key] = false; i = i + 5
+                elseif j:sub(i, i + 3) == "null" then r[key] = nil; i = i + 4
+                else i = i + 1 end
+            end
+        end
     end
-    for k, v in string.gmatch(j, '"([^"]+)"%s*:%s*([%d%.%-]+)') do
-        if not r[k] then r[k] = tonumber(v) end
+    -- Fallback for numeric values missed due to string parsing edge (keep compat)
+    if next(r) == nil then
+        for k, v in string.gmatch(j, '"([^"]+)"%s*:%s*([%d%.%-]+)') do
+            if not r[k] then r[k] = tonumber(v) end
+        end
     end
     return r
 end

@@ -131,8 +131,10 @@ function start_generation()
             shell_quote(audio_track),
             shell_quote(audio_channel)
         )
-        local cmd = inner_cmd .. " > /dev/null 2>&1 < /dev/null & echo $!"
+        local log_file = tmp_file .. ".log"
+        local cmd = inner_cmd .. " >> " .. shell_quote(log_file) .. " 2>&1 < /dev/null & echo $!"
         vlc.msg.info("[AI Subs] cmd: " .. cmd)
+        vlc.msg.info("[AI Subs] log: " .. log_file)
         if not (io and io.popen) then
             vlc.msg.err("[AI Subs] io.popen not available")
             set_status("Error: io.popen not available in this VLC build")
@@ -171,16 +173,33 @@ function poll_progress()
     local f = io.open(_poll_tmp, "r")
     if not f then
         vlc.msg.warn("[AI Subs] poll: cannot open " .. tostring(_poll_tmp))
+        -- Try to surface log diagnostics even while waiting
+        local log_f = io.open(_poll_tmp .. ".log", "r")
+        local log_hint = ""
+        if log_f then
+            local lc = log_f:read("*a") or ""
+            log_f:close()
+            if lc:find("error") or lc:find("Error") or lc:find("Traceback") then
+                log_hint = " — " .. lc:gsub("%s+", " "):sub(-180)
+            end
+        end
         if _poll_secs > 30 then
-            set_status("Error: temp file lost. Check VLC logs.")
+            local msg = "Error: temp file lost." .. log_hint .. " Check log: " .. tostring(_poll_tmp) .. ".log"
+            vlc.msg.err("[AI Subs] " .. msg)
+            set_status(msg)
             if _poll_tmr then
                 if _poll_tmr.cancel then _poll_tmr:cancel() end
                 _poll_tmr=nil
             end
-            _poll_tmp = nil
+            -- Do not clear _poll_tmp immediately — let process_results surface log
+            process_results(_poll_tmp)
             return
         end
-        set_status(string.format("Loading model / starting... %ds", _poll_secs))
+        if log_hint ~= "" and _poll_secs > 10 then
+            set_status(string.format("Starting... %ds — %s", _poll_secs, log_hint:sub(1, 120)))
+        else
+            set_status(string.format("Loading model / starting... %ds", _poll_secs))
+        end
         if _poll_tmr and _poll_tmp then
             _poll_tmr:schedule(POLL_US)
         end
@@ -244,30 +263,39 @@ function poll_progress()
 end
 
 function process_results(tmp_file)
+    local log_file = tmp_file .. ".log"
     local f = io.open(tmp_file, "r")
     if not f then
-        set_status("Error: Whisper produced no output. Check VLC logs.")
+        -- Try to surface log diagnostics when protocol file is missing
+        local lf = io.open(log_file, "r")
+        if lf then
+            local log_content = lf:read("*a") or ""
+            lf:close()
+            vlc.msg.err("[AI Subs] tmp_file missing, log content:\n" .. log_content)
+            local short = log_content:gsub("%s+", " "):sub(1, 260)
+            if short ~= "" then
+                set_status("Error: no output. Log: " .. short)
+            else
+                set_status("Error: Whisper produced no output. Check log: " .. log_file)
+            end
+        else
+            set_status("Error: Whisper produced no output. Check VLC logs / " .. log_file)
+        end
         _poll_tmp = nil
         return
     end
 
     local srt_path  = nil
     local seg_count = 0
+    local err_msg   = nil
+    local saw_error = false
 
     for line in f:lines() do
         local d = parse_json(line)
         if d then
             if d.type == "error" then
-                set_status("Error: " .. (d.msg or "unknown"))
-                f:close()
-                if os and os.remove then
-                    os.remove(tmp_file)
-                    os.remove(tmp_file:gsub("%.txt$",".vbs"))
-                    os.remove(tmp_file..".log")
-                end
-                _poll_tmp = nil
-                _poll_pid = nil
-                return
+                saw_error = true
+                err_msg = d.msg or err_msg or "unknown"
             elseif d.type == "sub" then
                 seg_count = seg_count + 1
             elseif d.type == "done" then
@@ -277,6 +305,49 @@ function process_results(tmp_file)
         end
     end
     f:close()
+
+    if saw_error then
+        vlc.msg.err("[AI Subs] transcription error: " .. tostring(err_msg))
+        vlc.msg.info("[AI Subs] protocol kept at: " .. tmp_file .. " log: " .. log_file)
+        set_status("Error: " .. (err_msg or "unknown") .. " (log: " .. log_file .. ")")
+        -- Preserve tmp_file and log for diagnosis; do not delete
+        _poll_tmp = nil
+        _poll_pid = nil
+        return
+    end
+
+    if not srt_path then
+        -- No done message — surface log to user
+        local hint = ""
+        local lf = io.open(log_file, "r")
+        if lf then
+            local log_content = lf:read("*a") or ""
+            lf:close()
+            vlc.msg.err("[AI Subs] no srt_path, log tail:\n" .. log_content:sub(-2000))
+            local short = log_content:gsub("%s+", " "):sub(-300)
+            if short ~= "" then hint = " Log: " .. short end
+        end
+        vlc.msg.err("[AI Subs] transcription failed — no srt_path in " .. tmp_file)
+        set_status("Error: transcription failed (no SRT)." .. hint .. " Check " .. log_file)
+        -- Preserve files for diagnosis
+        _poll_tmp = nil
+        _poll_pid = nil
+        return
+    end
+
+    -- Success: verify SRT exists before cleaning up
+    local sf = io.open(srt_path, "r")
+    if not sf then
+        vlc.msg.err("[AI Subs] srt_path reported but file missing: " .. tostring(srt_path))
+        set_status("Error: SRT not found at " .. tostring(srt_path) .. " — check write permissions. Log: " .. log_file)
+        -- Preserve protocol/log
+        _poll_tmp = nil
+        _poll_pid = nil
+        return
+    end
+    sf:close()
+
+    -- Cleanup protocol files only on success
     if os and os.remove then
         os.remove(tmp_file)
         os.remove(tmp_file:gsub("%.txt$",".vbs"))
@@ -285,11 +356,10 @@ function process_results(tmp_file)
     _poll_tmp = nil
     _poll_pid = nil
 
-    if not srt_path then
-        set_status("Error: transcription failed. Check VLC logs for details.")
-        return
-    end
-
     load_subtitle(srt_path)
-    set_status("Done! " .. seg_count .. " segments. Subtitles loaded.")
+    if seg_count == 0 then
+        set_status("Done (0 segments) — subtitles file created but empty. Check audio. File: " .. srt_path)
+    else
+        set_status("Done! " .. seg_count .. " segments. Subtitles loaded.")
+    end
 end
